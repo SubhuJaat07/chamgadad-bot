@@ -9,20 +9,40 @@ import {
   WebhookClient,
   Partials
 } from "discord.js";
+import { createClient } from "@supabase/supabase-js";
 
 // ============================================================
 // CONFIG
 // ============================================================
 const OWNERS = (process.env.OWNER_IDS || "").split(",").filter(Boolean);
-const PREFIX = process.env.PREFIX || null; // optional prefix mode
+const MIMIC_LOG_WEBHOOK = process.env.MIMIC_LOG_WEBHOOK || null;
+const PREFIX = process.env.PREFIX || null;
+
+// Mimic log webhook client
+let mimicLogWebhook = null;
+if (MIMIC_LOG_WEBHOOK) {
+  try { mimicLogWebhook = new WebhookClient({ url: MIMIC_LOG_WEBHOOK }); }
+  catch (e) { console.error("❌ Invalid MIMIC_LOG_WEBHOOK URL:", e.message); }
+}
+
+// ============================================================
+// SUPABASE
+// ============================================================
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
+  supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+  console.log("✅ Supabase connected.");
+} else {
+  console.log("⚠️ Supabase not configured — using in-memory only.");
+}
 
 // ============================================================
 // IN-MEMORY STORES
 // ============================================================
-const afkUsers = new Map();       // userId -> { reason, timestamp, guildId }
-const afkBlacklist = new Set();    // userIds who are blacklisted from AFK
+const afkUsers = new Map();         // userId -> { reason, timestamp, guildId }
+const afkBlacklist = new Map();     // userId -> reason (Map for Supabase sync)
 const autoReactChannels = new Map(); // channelId -> Set<emoji>
-const mimicWebhooks = new Map();   // channelId -> webhookId
+const mimicWebhooks = new Map();    // channelId -> webhookId
 
 // ============================================================
 // CLIENT SETUP
@@ -39,7 +59,11 @@ const client = new Client({
 
 client.once("ready", async () => {
   console.log(`✅ ${client.user.tag} is online!`);
+  console.log(`👑 Owners: ${OWNERS.join(", ") || "none"}`);
   client.user.setActivity("chamgadad mode", { type: ActivityType.Playing });
+
+  // Load from Supabase
+  await loadDataFromSupabase();
 
   // Register slash commands globally
   await registerCommands();
@@ -123,6 +147,9 @@ client.on("interactionCreate", async (interaction) => {
     if (commandName === "afklist") return handleAfkList(interaction);
     if (commandName === "afkblacklist") return handleAfkBlacklist(interaction);
     if (commandName === "autoreact") return handleAutoReact(interaction);
+
+  // Owner-only debug command
+  if (commandName === "reload") return handleReload(interaction);
   }
 });
 
@@ -202,6 +229,11 @@ client.on("messageCreate", async (message) => {
 // COMMAND: /mimic — Send message as webhook (looks like another user)
 // ============================================================
 async function handleMimic(interaction) {
+  // Owner check
+  if (!OWNERS.includes(interaction.user.id)) {
+    return interaction.reply({ content: "❌ Owner only command!", ephemeral: true });
+  }
+
   await interaction.deferReply({ ephemeral: false });
 
   const target = interaction.options.getUser("user");
@@ -234,6 +266,43 @@ async function handleMimic(interaction) {
       avatarURL: target.displayAvatarURL({ size: 128 }),
       files: image ? [image.url] : undefined,
     });
+
+    // --- LOG TO MIMIC WEBHOOK ---
+    if (mimicLogWebhook) {
+      try {
+        await mimicLogWebhook.send({
+          embeds: [new EmbedBuilder()
+            .setTitle("🎭 Mimic Used")
+            .setColor(0x5865F2)
+            .addFields(
+              { name: "Mimicked As", value: `${target.username} (<@${target.id}>)`, inline: true },
+              { name: "Used By", value: `${interaction.user.username} (<@${interaction.user.id}>)`, inline: true },
+              { name: "Server", value: `${interaction.guild.name} (\`${interaction.guild.id}\`)`, inline: true },
+              { name: "Channel", value: `<#${interaction.channel.id}>`, inline: true },
+              { name: "Message", value: msg.slice(0, 500) }
+            )
+            .setThumbnail(target.displayAvatarURL({ size: 64 }))
+            .setFooter({ text: `Mimic Log • ${interaction.guild.name}` })
+            .setTimestamp()]
+        });
+      } catch (logErr) {
+        console.error("[Mimic] Webhook log failed:", logErr.message);
+      }
+    }
+
+    // --- LOG TO SUPABASE ---
+    if (supabase) {
+      supabase.from("chamgadad_mimic_logs").insert({
+        guild_id: interaction.guild.id,
+        channel_id: interaction.channel.id,
+        target_id: target.id,
+        target_name: target.username,
+        used_by: interaction.user.id,
+        used_by_name: interaction.user.username,
+        message: msg.slice(0, 1000),
+        has_image: !!image,
+      }).catch(() => {});
+    }
 
     await interaction.editReply({
       embeds: [new EmbedBuilder()
@@ -359,14 +428,25 @@ async function handleAfkList(interaction) {
 }
 
 // ============================================================
-// COMMAND: /afkblacklist — Manage AFK blacklist
+// COMMAND: /afkblacklist — Manage AFK blacklist (OWNER ONLY)
 // ============================================================
 async function handleAfkBlacklist(interaction) {
+  // Owner check
+  if (!OWNERS.includes(interaction.user.id)) {
+    return interaction.reply({ content: "❌ Owner only command!", ephemeral: true });
+  }
+
   const sub = interaction.options.getSubcommand();
 
   if (sub === "add") {
     const user = interaction.options.getUser("user");
-    afkBlacklist.add(user.id);
+    const reason = "AFK blacklist";
+    afkBlacklist.set(user.id, reason);
+
+    // Save to Supabase
+    if (supabase) {
+      supabase.from("chamgadad_afk_blacklist").upsert({ user_id: user.id, reason }, { onConflict: "user_id" }).catch(() => {});
+    }
 
     // Also remove from AFK if currently AFK
     if (afkUsers.has(user.id)) {
@@ -395,6 +475,12 @@ async function handleAfkBlacklist(interaction) {
       });
     }
     afkBlacklist.delete(user.id);
+
+    // Remove from Supabase
+    if (supabase) {
+      supabase.from("chamgadad_afk_blacklist").delete().eq("user_id", user.id).catch(() => {});
+    }
+
     return interaction.reply({
       embeds: [new EmbedBuilder()
         .setColor(0x57F287)
@@ -412,7 +498,7 @@ async function handleAfkBlacklist(interaction) {
     }
 
     const list = [];
-    for (const uid of afkBlacklist) {
+    for (const [uid, reason] of afkBlacklist) {
       const user = await client.users.fetch(uid).catch(() => null);
       list.push(`${list.length + 1}. <@${uid}> — ${user?.tag || "Unknown"} (\`${uid}\`)`);
     }
@@ -436,7 +522,6 @@ async function handleAutoReact(interaction) {
   if (sub === "add") {
     const emoji = interaction.options.getString("emoji");
 
-    // Validate emoji
     if (!isValidEmoji(emoji)) {
       return interaction.reply({
         embeds: [new EmbedBuilder()
@@ -450,6 +535,15 @@ async function handleAutoReact(interaction) {
       autoReactChannels.set(interaction.channel.id, new Set());
     }
     autoReactChannels.get(interaction.channel.id).add(emoji);
+
+    // Save to Supabase
+    if (supabase) {
+      const emojis = [...autoReactChannels.get(interaction.channel.id)];
+      supabase.from("chamgadad_autoreact").upsert(
+        { channel_id: interaction.channel.id, guild_id: interaction.guild.id, emojis },
+        { onConflict: "channel_id" }
+      ).catch(() => {});
+    }
 
     return interaction.reply({
       embeds: [new EmbedBuilder()
@@ -472,7 +566,22 @@ async function handleAutoReact(interaction) {
     }
 
     channelReacts.delete(emoji);
-    if (channelReacts.size === 0) autoReactChannels.delete(interaction.channel.id);
+    if (channelReacts.size === 0) {
+      autoReactChannels.delete(interaction.channel.id);
+      // Remove from Supabase
+      if (supabase) {
+        supabase.from("chamgadad_autoreact").delete().eq("channel_id", interaction.channel.id).catch(() => {});
+      }
+    } else {
+      // Update Supabase
+      if (supabase) {
+        const emojis = [...channelReacts];
+        supabase.from("chamgadad_autoreact").upsert(
+          { channel_id: interaction.channel.id, guild_id: interaction.guild.id, emojis },
+          { onConflict: "channel_id" }
+        ).catch(() => {});
+      }
+    }
 
     return interaction.reply({
       embeds: [new EmbedBuilder()
@@ -503,6 +612,9 @@ async function handleAutoReact(interaction) {
 
   if (sub === "clear") {
     autoReactChannels.delete(interaction.channel.id);
+    if (supabase) {
+      supabase.from("chamgadad_autoreact").delete().eq("channel_id", interaction.channel.id).catch(() => {});
+    }
     return interaction.reply({
       embeds: [new EmbedBuilder()
         .setColor(0x57F287)
@@ -534,6 +646,55 @@ function getDuration(timestamp) {
   if (days > 0) return `${days}d ${hours % 24}h`;
   if (hours > 0) return `${hours}h ${mins % 60}m`;
   return `${mins}m`;
+}
+
+// ============================================================
+// COMMAND: /reload — Reload data from Supabase (OWNER ONLY)
+// ============================================================
+async function handleReload(interaction) {
+  if (!OWNERS.includes(interaction.user.id)) {
+    return interaction.reply({ content: "❌ Owner only command!", ephemeral: true });
+  }
+
+  await loadDataFromSupabase();
+
+  return interaction.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(0x57F287)
+      .setDescription(`✅ Reloaded from Supabase!\n\n📊 **Stats:**\n- AFK Blacklist: ${afkBlacklist.size} user(s)\n- Auto-React Channels: ${autoReactChannels.size}`)]
+  });
+}
+
+// ============================================================
+// SUPABASE DATA LOADER
+// ============================================================
+async function loadDataFromSupabase() {
+  if (!supabase) return;
+
+  try {
+    // Load AFK blacklist
+    const { data: blData } = await supabase.from("chamgadad_afk_blacklist").select("*");
+    if (blData && blData.length > 0) {
+      afkBlacklist.clear();
+      for (const row of blData) {
+        afkBlacklist.set(row.user_id, row.reason || "AFK blacklist");
+      }
+      console.log(`✅ Loaded ${blData.length} AFK blacklist entries.`);
+    }
+
+    // Load auto-react channels
+    const { data: arData } = await supabase.from("chamgadad_autoreact").select("*");
+    if (arData && arData.length > 0) {
+      autoReactChannels.clear();
+      for (const row of arData) {
+        const emojis = Array.isArray(row.emojis) ? row.emojis : [];
+        autoReactChannels.set(row.channel_id, new Set(emojis));
+      }
+      console.log(`✅ Loaded ${arData.length} auto-react channel(s).`);
+    }
+  } catch (e) {
+    console.error("[Supabase] Failed to load data:", e.message);
+  }
 }
 
 // ============================================================
